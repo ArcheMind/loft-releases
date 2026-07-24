@@ -1,0 +1,194 @@
+name: Sync Loft manual release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-loft-manual-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SOURCE_BASE_URL: https://loft.archemind.org/updates/manual
+      GH_REPO: ArcheMind/loft-releases
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read source release metadata
+        id: release
+        run: |
+          curl --fail --location --retry 6 --retry-delay 5 \
+            "${SOURCE_BASE_URL}/release.json" \
+            --output "${RUNNER_TEMP}/source-release.json"
+          node <<'NODE'
+          const fs = require('node:fs');
+          const release = JSON.parse(
+            fs.readFileSync(`${process.env.RUNNER_TEMP}/source-release.json`, 'utf8'),
+          );
+          if (!/^0\.1\.\d+-manual\.\d+$/.test(release.version)) {
+            throw new Error(`Unexpected manual release version: ${release.version}`);
+          }
+          for (const kind of ['dmg', 'zip']) {
+            const file = release.files?.[kind];
+            if (
+              !file ||
+              !/^[A-Za-z0-9._-]+$/.test(file.name) ||
+              !/^[0-9a-f]{64}$/.test(file.sha256)
+            ) {
+              throw new Error(`Invalid ${kind} release metadata`);
+            }
+          }
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, [
+            `version=${release.version}`,
+            `tag=manual-v${release.version}`,
+            `commit=${release.commit}`,
+            `dmg_name=${release.files.dmg.name}`,
+            `dmg_sha256=${release.files.dmg.sha256}`,
+            `zip_name=${release.files.zip.name}`,
+            `zip_sha256=${release.files.zip.sha256}`,
+            '',
+          ].join('\n'));
+          NODE
+
+      - name: Check whether the release already exists
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          if gh release view "${RELEASE_TAG}" --repo "${GH_REPO}" >/dev/null 2>&1; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Download and verify release assets
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          DMG_NAME: ${{ steps.release.outputs.dmg_name }}
+          DMG_SHA256: ${{ steps.release.outputs.dmg_sha256 }}
+          ZIP_NAME: ${{ steps.release.outputs.zip_name }}
+          ZIP_SHA256: ${{ steps.release.outputs.zip_sha256 }}
+        run: |
+          install -d "${RUNNER_TEMP}/loft-release"
+          curl --fail --location --retry 6 --retry-delay 5 \
+            "${SOURCE_BASE_URL}/${DMG_NAME}" \
+            --output "${RUNNER_TEMP}/loft-release/Loft-manual-latest-universal.dmg"
+          curl --fail --location --retry 6 --retry-delay 5 \
+            "${SOURCE_BASE_URL}/${ZIP_NAME}" \
+            --output "${RUNNER_TEMP}/loft-release/Loft-manual-latest-universal.zip"
+          printf '%s  %s\n' \
+            "${DMG_SHA256}" \
+            "${RUNNER_TEMP}/loft-release/Loft-manual-latest-universal.dmg" \
+            | sha256sum --check
+          printf '%s  %s\n' \
+            "${ZIP_SHA256}" \
+            "${RUNNER_TEMP}/loft-release/Loft-manual-latest-universal.zip" \
+            | sha256sum --check
+
+      - name: Prepare public metadata and release notes
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          cp "${RUNNER_TEMP}/source-release.json" \
+            "${RUNNER_TEMP}/loft-release/release.json"
+          cp assets/loft-icon.png \
+            "${RUNNER_TEMP}/loft-release/Loft-icon.png"
+          node <<'NODE'
+          const fs = require('node:fs');
+          const releasePath = `${process.env.RUNNER_TEMP}/loft-release/release.json`;
+          const release = JSON.parse(fs.readFileSync(releasePath, 'utf8'));
+          release.hosting = 'github-release';
+          release.releasePage =
+            `https://github.com/ArcheMind/loft-releases/releases/tag/${process.env.RELEASE_TAG}`;
+          release.downloads = {
+            dmg:
+              `https://github.com/ArcheMind/loft-releases/releases/download/${process.env.RELEASE_TAG}/Loft-manual-latest-universal.dmg`,
+            zip:
+              `https://github.com/ArcheMind/loft-releases/releases/download/${process.env.RELEASE_TAG}/Loft-manual-latest-universal.zip`,
+          };
+          fs.writeFileSync(releasePath, `${JSON.stringify(release, null, 2)}\n`);
+          fs.writeFileSync(
+            `${process.env.RUNNER_TEMP}/loft-release/INSTALL.txt`,
+            [
+              `Loft manual distribution ${release.version}`,
+              '',
+              'This Universal macOS build supports Apple Silicon and Intel.',
+              'Automatic updates are disabled. This build is Developer ID signed but may not',
+              'yet be notarized by Apple.',
+              '',
+              'Install:',
+              '1. Open the DMG and drag Loft to Applications.',
+              '2. In Applications, Control-click Loft and choose Open.',
+              '3. If macOS still blocks the app, use System Settings > Privacy & Security >',
+              '   Open Anyway.',
+              '',
+              'Download page:',
+              'https://loft.archemind.org/download/',
+              '',
+            ].join('\n'),
+          );
+          fs.writeFileSync(
+            `${process.env.RUNNER_TEMP}/loft-release/RELEASE_NOTES.md`,
+            [
+              '## Loft manual beta',
+              '',
+              'Universal macOS build for Apple Silicon and Intel.',
+              '',
+              `- Version: \`${release.version}\``,
+              `- Source commit: \`${release.commit}\``,
+              `- DMG SHA-256: \`${release.files.dmg.sha256}\``,
+              `- ZIP SHA-256: \`${release.files.zip.sha256}\``,
+              '- Automatic updates: disabled',
+              '- Apple notarization: pending',
+              '',
+              'See the [Loft download page](https://loft.archemind.org/download/) for first-launch instructions.',
+              '',
+            ].join('\n'),
+          );
+          NODE
+
+      - name: Publish GitHub Release
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          SOURCE_COMMIT: ${{ steps.release.outputs.commit }}
+        run: |
+          gh release create "${RELEASE_TAG}" \
+            --repo "${GH_REPO}" \
+            --target "${GITHUB_SHA}" \
+            --title "Loft ${RELEASE_VERSION} · Manual Beta" \
+            --notes-file "${RUNNER_TEMP}/loft-release/RELEASE_NOTES.md" \
+            "${RUNNER_TEMP}/loft-release/Loft-manual-latest-universal.dmg" \
+            "${RUNNER_TEMP}/loft-release/Loft-manual-latest-universal.zip" \
+            "${RUNNER_TEMP}/loft-release/release.json" \
+            "${RUNNER_TEMP}/loft-release/INSTALL.txt" \
+            "${RUNNER_TEMP}/loft-release/Loft-icon.png"
+
+      - name: Verify anonymous downloads
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          for asset in \
+            Loft-manual-latest-universal.dmg \
+            Loft-manual-latest-universal.zip \
+            release.json \
+            Loft-icon.png
+          do
+            curl --fail --location --head --retry 12 --retry-delay 5 \
+              "https://github.com/ArcheMind/loft-releases/releases/download/${RELEASE_TAG}/${asset}"
+          done
